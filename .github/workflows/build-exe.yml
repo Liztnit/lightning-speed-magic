@@ -1,0 +1,79 @@
+name: Build and Release EXE
+
+# Every push to main now builds AND publishes an update automatically.
+# No manual tagging needed anymore.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed so this workflow can push the version bump and publish the Release
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # Bumps 1.0.1 -> 1.0.2 automatically. electron-updater only notices an
+      # update if the version number actually increased, so this has to happen
+      # on every run.
+      - name: Bump patch version
+        run: npm version patch --no-git-tag-version
+
+      - name: Read new version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content package.json | ConvertFrom-Json).version
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+
+      # Commits the bumped package.json back to main. "[skip ci]" in the message
+      # tells GitHub not to re-trigger this same workflow from this commit,
+      # which would otherwise create an infinite loop.
+      - name: Commit version bump back to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
+          git push
+
+      # MOVED: the tag now gets pushed before building/publishing, since
+      # GitHub requires a published (non-draft) release's tag to already
+      # exist at creation time.
+      - name: Tag this release
+        run: |
+          git tag v${{ steps.version.outputs.version }}
+          git push origin v${{ steps.version.outputs.version }}
+
+      # ADDED: pre-creates the GitHub Release before electron-builder runs.
+      # Without this, electron-builder's own release-creation can race itself
+      # (blockmap and exe uploads each independently check "does a release
+      # exist?" at nearly the same moment), producing two separate releases
+      # for the same tag with assets split between them. Creating it first
+      # means electron-builder just finds and uploads to the existing one.
+      - name: Pre-create GitHub Release
+        run: gh release create v${{ steps.version.outputs.version }} --title "${{ steps.version.outputs.version }}" --notes "Automated release"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build web app for desktop
+        run: npm run build:desktop
+
+      - name: Build and publish exe
+        run: npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEBUG: electron-builder

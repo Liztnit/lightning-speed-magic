@@ -1,0 +1,131 @@
+// Prism desktop shell. The built app is served over a local HTTP server rather
+// than file:// so that browser storage (saved shows) and popup projector windows work.
+const { app, BrowserWindow, shell } = require("electron");
+const { autoUpdater } = require("electron-updater");
+const log = require("electron-log");
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = path.join(__dirname, "..", "dist-electron");
+
+// Makes Electron use "Prism" everywhere (window title, log folder, userData
+// folder) instead of the package.json "name" (tanstack_start_ts).
+app.setName("Prism");
+
+const types = {
+  ".html": "text/html",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".map": "application/json",
+};
+
+// Keep the origin stable across launches. IndexedDB is scoped to scheme + host + port,
+// so an ephemeral port would make every saved show appear to vanish after restart.
+const APP_PORT = 47831;
+
+function startServer() {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url, "http://localhost");
+      let file = path.join(root, decodeURIComponent(url.pathname));
+      if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+        file = path.join(root, "index.html"); // client-side routing fallback
+      }
+      res.setHeader("Content-Type", types[path.extname(file)] || "application/octet-stream");
+      fs.createReadStream(file).pipe(res);
+    });
+    server.once("error", (error) => {
+      // Do not silently fall back to a random port: that would change the IndexedDB origin.
+      reject(new Error(`Prism could not start its local server on port ${APP_PORT}: ${error.message}`));
+    });
+    server.listen(APP_PORT, "127.0.0.1", () => resolve(`http://127.0.0.1:${APP_PORT}`));
+  });
+}
+
+let base = "";
+
+function makeWindow(route, options = {}) {
+  const win = new BrowserWindow({
+    width: options.width ?? 1440,
+    height: options.height ?? 900,
+    backgroundColor: "#0b0d12",
+    autoHideMenuBar: true,
+    // Projector windows sit behind or beside the editor. With throttling on, Chromium slows
+    // their timers and animation frames when they are hidden or covered, which breaks
+    // video sync and makes playback stutter.
+    webPreferences: { contextIsolation: true, nodeIntegration: false, backgroundThrottling: false },
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    // projector windows open as extra app windows
+    if (url.startsWith(base)) {
+      const target = url.slice(base.length) || "/";
+      makeWindow(target, { width: 960, height: 540 });
+      return { action: "deny" };
+    }
+    void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  void win.loadURL(base + route);
+  return win;
+}
+
+function showMissingFiles(win) {
+  const message = `Prism could not find its app files.\n\nExpected: ${path.join(root, "index.html")}\n\nPlease re-download and unzip the whole folder, then run Prism.exe again.`;
+  const page = `<body style="background:#0b0d12;color:#e6e8ef;font:14px system-ui;padding:32px;white-space:pre-wrap">${message}</body>`;
+  void win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(page));
+}
+
+app.whenReady().then(async () => {
+  try {
+    base = await startServer();
+  } catch (error) {
+    log.error(error);
+    const win = new BrowserWindow({ width: 720, height: 360, autoHideMenuBar: true });
+    const message = error instanceof Error ? error.message : String(error);
+    void win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(
+      `<body style="background:#0b0d12;color:#e6e8ef;font:14px system-ui;padding:32px;white-space:pre-wrap">${message}\n\nClose any other Prism instance and try again.</body>`,
+    ));
+    return;
+  }
+  const win = makeWindow("/");
+  if (!fs.existsSync(path.join(root, "index.html"))) showMissingFiles(win);
+
+  log.transports.file.level = "info";
+  autoUpdater.logger = log;
+
+  // The default "github" provider resolves the latest release through
+  // GitHub's releases Atom feed, which has a known intermittent 406 bug.
+  // Pointing at GitHub's stable /releases/latest/download/ URL instead avoids
+  // that broken lookup entirely, while still serving the exact same files.
+  autoUpdater.setFeedURL({
+    provider: "generic",
+    url: "https://github.com/tobiasejh/lightning-speed-magic/releases/latest/download",
+  });
+
+  autoUpdater.on("checking-for-update", () => log.info("Checking for update..."));
+  autoUpdater.on("update-available", (info) => log.info("Update available:", info.version));
+  autoUpdater.on("update-not-available", (info) =>
+    log.info("No update available. Current:", info.version),
+  );
+  autoUpdater.on("error", (err) => log.error("Updater error:", err));
+  autoUpdater.on("download-progress", (p) => log.info(`Downloading: ${Math.round(p.percent)}%`));
+  autoUpdater.on("update-downloaded", (info) => log.info("Update downloaded:", info.version));
+
+  autoUpdater.checkForUpdatesAndNotify();
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) makeWindow("/");
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
